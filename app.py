@@ -10,7 +10,7 @@ import os
 
 import streamlit as st
 
-from agent import OfflineIntakeAgent, OpenAIIntakeAgent
+from agent import JevClient, JevIntakeAgent, OfflineIntakeAgent, OpenAIIntakeAgent
 from triage_engine import FIELDS, Outcome, evaluate, red_flag_fields_for
 from workflow import TriageSession, handoff_summary
 
@@ -44,50 +44,66 @@ def _secret(name: str) -> str | None:
     return os.environ.get(name)
 
 
-def make_agent(use_llm: bool):
-    key = _secret("OPENAI_API_KEY")
-    if use_llm and key:
-        return OpenAIIntakeAgent(api_key=key, model=_secret("OPENAI_MODEL") or "gpt-4o-mini")
+MODE_JEV = "Jev decision model"
+MODE_OPENAI = "OpenAI only"
+MODE_OFFLINE = "Offline (keyword)"
+
+
+def make_agent(mode: str):
+    openai_key = _secret("OPENAI_API_KEY")
+    language = (OpenAIIntakeAgent(api_key=openai_key, model=_secret("OPENAI_MODEL") or "gpt-4o-mini")
+                if openai_key else OfflineIntakeAgent())
+    if mode == MODE_JEV:
+        return JevIntakeAgent(JevClient(_secret("OPENROUTER_API_KEY")), language)
+    if mode == MODE_OPENAI:
+        return language
     return OfflineIntakeAgent()
 
 
-def new_case(use_llm: bool) -> None:
-    st.session_state.session = TriageSession(make_agent(use_llm))
-    st.session_state.use_llm = use_llm
+def new_case(mode: str) -> None:
+    st.session_state.session = TriageSession(make_agent(mode))
+    st.session_state.mode = mode
 
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 has_key = bool(_secret("OPENAI_API_KEY"))
+has_jev = bool(_secret("OPENROUTER_API_KEY"))
 with st.sidebar:
     st.title("🩺 TriageFlow")
     st.caption("AI-powered intake & rule-based triage prototype")
     st.warning("**Educational prototype.** Fictional adult cases only. Outputs demonstrate example "
                "software rules and are **not medical advice**. In a real emergency, call 911.")
 
-    use_llm = st.toggle("Use OpenAI intake agent", value=has_key, disabled=not has_key,
-                        help="Without an API key the app runs an offline keyword agent.")
+    modes = ([MODE_JEV] if has_jev else []) + ([MODE_OPENAI] if has_key else []) + [MODE_OFFLINE]
+    mode = st.radio("Fact extraction", modes,
+                    help="Jev: yes/no facts come from decision-model probabilities and fixed thresholds. "
+                         "OpenAI only: the LLM returns yes/no facts directly. Offline: keyword rules.")
+    if not has_jev:
+        st.caption("Add `OPENROUTER_API_KEY` to `.streamlit/secrets.toml` to enable the Jev decision model.")
     if not has_key:
-        st.caption("No `OPENAI_API_KEY` found in `.streamlit/secrets.toml` or the environment — "
-                   "running in offline demo mode.")
+        st.caption("No `OPENAI_API_KEY` found — free-text extraction uses the offline keyword agent.")
 
-    if "session" not in st.session_state or st.session_state.get("use_llm") != use_llm:
-        new_case(use_llm)
+    if "session" not in st.session_state or st.session_state.get("mode") != mode:
+        new_case(mode)
 
     if st.button("➕ Start new case", width="stretch"):
-        new_case(use_llm)
+        new_case(mode)
         st.rerun()
 
     st.subheader("Sample scenarios")
     sample = None
     for label, text in SAMPLE_CASES.items():
         if st.button(label, width="stretch"):
-            new_case(use_llm)
+            new_case(mode)
             sample = text
 
     st.divider()
     st.caption(f"Agent: **{st.session_state.session.agent.name}**")
+    cost = st.session_state.session.state.get("decision_cost", 0.0)
+    if cost:
+        st.caption(f"Jev cost this case: ${cost:.6f}")
 
 session: TriageSession = st.session_state.session
 state = session.state
@@ -147,16 +163,28 @@ with case_col:
             st.caption("Still needed: " + ", ".join(FIELDS[f].label for f in live.missing_fields))
 
     st.subheader("Structured facts")
+    scores = state.get("fact_scores", {})
     if facts:
         rows = []
         for key, spec in FIELDS.items():
             if key in facts:
                 v = facts[key]
-                rows.append({"Finding": spec.label,
-                             "Value": "✅ yes" if v is True else "❌ no" if v is False else str(v)})
+                row = {"Finding": spec.label,
+                       "Value": "✅ yes" if v is True else "❌ no" if v is False else str(v)}
+                if scores:
+                    row["Jev score"] = f"{scores[key]:.2f}" if key in scores else "—"
+                rows.append(row)
         st.dataframe(rows, hide_index=True, width="stretch")
+        if scores:
+            st.caption("Jev score = p(yes) for yes/no findings (p(category) for the main complaint). "
+                       "Thresholds: asked field yes ≥ 0.70, no ≤ 0.15; unasked finding yes ≥ 0.85.")
     else:
         st.caption("Nothing extracted yet.")
+
+    if state.get("uncertain"):
+        st.markdown("**Unclear answers (not accepted — re-asked)**")
+        for u in state["uncertain"]:
+            st.markdown(f"- {u}")
 
     if contradictions:
         st.markdown("**Contradictions**")

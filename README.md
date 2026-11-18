@@ -13,6 +13,33 @@ A user describes a fictional patient's symptoms in a chat. An AI intake agent tu
 
 > ⚠️ **Educational prototype only.** TriageFlow is for **fictional adult cases**. It is not a validated clinical decision-support tool, and its output is not medical advice. The rules are illustrative examples that have not been clinically reviewed. In a real emergency, call 911.
 
+## What's new in this version: Jev decision model
+
+This version builds on the previous TriageFlow assignment. It adds **[Jev](https://openrouter.ai/typesafe/jev-1.14)**, TypeSafe's decision model, called through OpenRouter's Decisions API. Jev doesn't generate text. For each question it returns a **probability**.
+
+**What changed:** the yes/no warning-sign answers, and the main complaint, are now decided by Jev's probabilities plus fixed thresholds in code. Before, GPT returned them directly. GPT still pulls out age, duration and severity and writes the acknowledgements. The rule engine, the order of questions, and every care-setting decision are unchanged.
+
+| Situation | Rule (in [agent.py](agent.py)) | Result |
+| --- | --- | --- |
+| Answer to the question just asked, p(yes) ≥ 0.70 | `YES_THRESHOLD` | Finding recorded as **present** |
+| p(yes) ≤ 0.15 **and** Jev rates the answer clear and complete (p ≥ 0.50) | `NO_THRESHOLD`, `CLEAR_ANSWER_THRESHOLD` | Finding recorded as **absent** |
+| Anything else | — | **Unknown**: the question is asked again and the answer is listed as unclear |
+| Finding volunteered without being asked, p(yes) ≥ 0.85 | `UNPROMPTED_YES_THRESHOLD` | Recorded as **present** (can never become "absent") |
+| Main complaint, p ≥ 0.60 | `CATEGORY_MIN_PROB` | Category accepted |
+
+Why the clarity check exists: p(yes) alone can't tell "no" apart from "unsure," because neither answer confirms anything. In testing, "Maybe? Hard to tell" scored p(yes) = 0.12, close to a real "no" (0.02–0.06). A second Jev question asks whether the answer is clear and complete, and only then can a warning sign be ruled out.
+
+All yes/no fields are scored in **one Jev request per turn**, about $0.00009 per turn. If Jev fails, the app falls back to GPT's extraction. The app shows each finding's Jev score, the answers it found unclear, and the running Jev cost. The handoff summary includes the scores too.
+
+**GPT vs. Jev on 16 labeled answers** (`python compare.py`):
+
+| | Correct | Avg time | Wrong in the unsafe direction |
+| --- | --- | --- | --- |
+| GPT-4o-mini alone | 15/16 | 0.88 s | 1 ("speech fine, no weakness" recorded as *no* for the whole neuro screen, though numbness and vision were never answered) |
+| Jev + thresholds | 15/16 | 0.25 s | 0 (its miss was re-asking "threw up once, nothing since") |
+
+Setup: add `OPENROUTER_API_KEY` to `.streamlit/secrets.toml`, then pick **Jev decision model** in the sidebar.
+
 ## Key design principle: the LLM never makes the triage decision
 
 The language model handles language only: it understands free text and writes a short acknowledgement before each question. Every care-setting decision comes from plain Python rules that can be read and tested.

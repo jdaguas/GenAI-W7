@@ -23,6 +23,10 @@ from triage_engine import CATEGORIES, FIELDS, OUT_OF_SCOPE_CATEGORY, sanitize_fa
 class Extraction:
     facts: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    # Decision-model output (empty for agents that don't use one):
+    scores: dict[str, float] = field(default_factory=dict)  # field -> probability behind an accepted fact
+    uncertain: list[str] = field(default_factory=list)      # answers too unclear to accept
+    cost: float = 0.0                                        # USD spent on decision calls this turn
 
 
 class IntakeAgent(Protocol):
@@ -238,3 +242,174 @@ class OfflineIntakeAgent:
 
     def phrase_question(self, field_key, facts, history) -> str:
         return FIELDS[field_key].question
+
+
+# ---------------------------------------------------------------------------
+# Jev decision-model agent (TypeSafe Jev via OpenRouter's Decisions API)
+# ---------------------------------------------------------------------------
+# Jev does not generate text: for each question it returns a probability.
+# These thresholds turn that probability into a fact. They live in plain code
+# so they can be reviewed and tested like the triage rules.
+JEV_MODEL = "typesafe/jev-1.14"
+JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+
+YES_THRESHOLD = 0.70             # answer to the question just asked: p(yes) >= this -> True
+NO_THRESHOLD = 0.15              # answer to the question just asked: p(yes) <= this -> False
+UNPROMPTED_YES_THRESHOLD = 0.85  # finding volunteered without being asked: can only become True
+CATEGORY_MIN_PROB = 0.60         # complaint category accepted only above this probability
+CLEAR_ANSWER_THRESHOLD = 0.50    # a "no" is accepted only if Jev rates the answer clear and complete
+
+# p(yes) alone cannot tell "no" from "unsure": both are "not a confirmation" and
+# score low (measured: "Maybe? Hard to tell" -> 0.12). So the asked field gets a
+# second question, and only a clear, complete answer can rule a warning sign out.
+_CLARITY_KEY = "_answer_is_clear"
+_CLARITY_QUESTION = {
+    "type": "noul",
+    "instructions": "Is the patient's answer a clear, definite response that covers everything the question asked about?",
+    "criteria": {
+        "true": "A direct yes, or a definite no that covers every symptom listed in the question",
+        "false": "Hedged, unsure, guessing, not yet checked, addresses only some of the listed symptoms, "
+                 "or does not answer the question",
+    },
+}
+
+_CATEGORY_CRITERIA = {
+    "headache": "Head pain, headache, or migraine",
+    "abdominal": "Stomach, belly, or abdominal pain or discomfort",
+    "respiratory": "Cough, breathing problems, wheezing, or chest-cold symptoms",
+    OUT_OF_SCOPE_CATEGORY: "Any other main complaint, or none described",
+}
+
+
+def decide_bool(p_yes: float, prompted: bool, p_clear: float = 1.0) -> Optional[bool]:
+    """Map Jev's p(yes) to True / False / None (unknown).
+
+    Only the field the user was actually asked about can become False, and only
+    when the answer is also rated clear. A low score on a field nobody asked
+    about just means "not mentioned", and the triage engine never treats "not
+    mentioned" as "no". A "yes" is never blocked: escalating is the safe side.
+    """
+    if prompted:
+        if p_yes >= YES_THRESHOLD:
+            return True
+        if p_yes <= NO_THRESHOLD and p_clear >= CLEAR_ANSWER_THRESHOLD:
+            return False
+        return None
+    return True if p_yes >= UNPROMPTED_YES_THRESHOLD else None
+
+
+def _noul_question(key: str) -> dict[str, Any]:
+    spec = FIELDS[key]
+    return {
+        "type": "noul",
+        "instructions": f"Based only on the patient's answer, does the patient report: {spec.description}",
+        "criteria": {
+            "true": f"The answer confirms this (or any part of it): {spec.description}",
+            "false": "The answer clearly denies this. Hedged, unsure, or unrelated answers are not a denial.",
+        },
+    }
+
+
+def _decision_state(user_message: str, last_question: Optional[str]) -> str:
+    parts = ["Fictional patient intake (educational prototype)."]
+    if last_question:
+        parts.append(f"Question the intake assistant asked: {last_question}")
+    parts.append(f"Patient's answer: {user_message}")
+    return "\n".join(parts)
+
+
+class JevClient:
+    """Thin client for OpenRouter's Decisions API. Swap in a fake for tests."""
+
+    def __init__(self, api_key: str, model: str = JEV_MODEL, url: str = JEV_URL, timeout: float = 30.0):
+        self.api_key, self.model, self.url, self.timeout = api_key, model, url, timeout
+
+    def decide(self, state: str, questions: dict[str, Any]) -> dict[str, Any]:
+        import httpx  # uses certifi, so it works with python.org builds on macOS
+
+        resp = httpx.post(
+            self.url,
+            json={"model": self.model, "state": state, "questions": questions},
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+class JevIntakeAgent:
+    """Jev decides yes/no facts and the category; a language agent does the rest.
+
+    * Every boolean field and the complaint category come from Jev's
+      probabilities via the thresholds above, in ONE request per turn.
+    * The wrapped language agent (OpenAI or offline) still extracts free-form
+      values (age, duration, severity) and writes the acknowledgement text.
+    * If Jev fails, the language agent's extraction is used unchanged.
+    """
+
+    def __init__(self, client: Any, language_agent: Any):
+        self.client = client
+        self.language = language_agent
+        self.name = f"Jev decision model + {language_agent.name}"
+
+    def extract(self, user_message, last_question, pending_field, facts) -> Extraction:
+        base = self.language.extract(user_message, last_question, pending_field, facts)
+
+        # Fields already reported present are sticky in merge_facts, so skip them.
+        bool_keys = [k for k, s in FIELDS.items() if s.type == "bool" and facts.get(k) is not True]
+        questions: dict[str, Any] = {k: _noul_question(k) for k in bool_keys}
+        if pending_field in bool_keys:
+            questions[_CLARITY_KEY] = _CLARITY_QUESTION
+        ask_category = "category" not in facts
+        if ask_category:
+            questions["category"] = {
+                "type": "choice",
+                "instructions": "What is the patient's main complaint?",
+                "criteria": _CATEGORY_CRITERIA,
+            }
+
+        try:
+            resp = self.client.decide(_decision_state(user_message, last_question), questions)
+            answers = resp["answers"]
+        except Exception as exc:  # network / API problems -> language-agent fallback
+            base.notes = " ".join(filter(None, [
+                base.notes, f"Jev unavailable ({type(exc).__name__}); used {self.language.name} for yes/no fields."]))
+            return base
+
+        # Free-form values come from the language agent; yes/no values only from Jev.
+        out = {k: v for k, v in base.facts.items() if FIELDS[k].type != "bool" and k != "category"}
+        scores: dict[str, float] = {}
+        uncertain: list[str] = []
+        clarity = answers.get(_CLARITY_KEY) or {}
+        p_clear = float(clarity["noul"]) if clarity.get("type") == "noul" else 0.0  # missing -> not clear
+
+        for k in bool_keys:
+            a = answers.get(k) or {}
+            if a.get("type") != "noul":  # refusal or missing -> leave unknown
+                continue
+            p = float(a["noul"])
+            prompted = k == pending_field
+            value = decide_bool(p, prompted, p_clear if prompted else 1.0)
+            if value is not None:
+                out[k], scores[k] = value, p
+            elif prompted:
+                uncertain.append(f"{FIELDS[k].label}: answer unclear "
+                                 f"(p(yes)={p:.2f}, p(clear)={p_clear:.2f}), not accepted")
+
+        if ask_category:
+            a = answers.get("category") or {}
+            if a.get("type") == "choice":
+                p = float(a.get("probabilities", {}).get(a.get("choice"), 0.0))
+                if p >= CATEGORY_MIN_PROB:
+                    out["category"], scores["category"] = a["choice"], p
+                elif pending_field == "category":
+                    uncertain.append(f"Main complaint: unclear (best guess {a.get('choice')}, p={p:.2f})")
+        elif "category" in base.facts:
+            out["category"] = base.facts["category"]
+
+        cost = float((resp.get("usage") or {}).get("cost") or 0.0)
+        return Extraction(facts=sanitize_facts(out), notes=base.notes, scores=scores,
+                          uncertain=uncertain, cost=cost)
+
+    def phrase_question(self, field_key, facts, history) -> str:
+        return self.language.phrase_question(field_key, facts, history)

@@ -6,7 +6,9 @@ One graph run happens per user message:
                                    \\--(no flag)--> assess --(info missing)--> ask -> END
                                                          \\--(decidable / budget spent)--> finalize -> END
 
-* ``extract``       the LLM agent turns the message into validated facts.
+* ``extract``       the agent turns the message into validated facts. With the
+                    Jev agent, yes/no facts come from decision-model
+                    probabilities and fixed thresholds (see agent.py).
 * ``safety_screen`` deterministic emergency check runs on EVERY turn, so red
                     flags are caught immediately instead of at the end of intake.
 * ``assess``        the rule engine says what is still missing; the workflow
@@ -41,6 +43,9 @@ class TriageState(TypedDict, total=False):
     pending_field: Optional[str]   # field the last question targeted
     questions_asked: int
     agent_notes: list[str]
+    fact_scores: dict[str, float]  # field -> decision-model probability behind the stored value
+    uncertain: list[str]           # answers the decision model found too unclear to accept
+    decision_cost: float           # running USD total of decision-model calls
     result: Optional[dict[str, Any]]
     status: Literal["intake", "complete"]
 
@@ -48,7 +53,8 @@ class TriageState(TypedDict, total=False):
 def initial_state() -> TriageState:
     return TriageState(
         messages=[], facts={}, contradictions=[], asked={}, pending_field=None,
-        questions_asked=0, agent_notes=[], result=None, status="intake",
+        questions_asked=0, agent_notes=[], fact_scores={}, uncertain=[], decision_cost=0.0,
+        result=None, status="intake",
     )
 
 
@@ -84,10 +90,16 @@ def build_graph(agent: IntakeAgent, checkpointer: Any = None):
         ext = agent.extract(user_msg, last_q, state.get("pending_field"), state.get("facts", {}))
         facts, new_contra = merge_facts(state.get("facts", {}), ext.facts)
         notes = state.get("agent_notes", []) + ([ext.notes] if ext.notes else [])
+        # Keep a score only if its value was actually stored (a sticky "yes" can reject a new "no").
+        scores = dict(state.get("fact_scores", {}))
+        scores.update({k: p for k, p in ext.scores.items() if facts.get(k) == ext.facts.get(k)})
         return {
             "facts": facts,
             "contradictions": state.get("contradictions", []) + new_contra,
             "agent_notes": notes,
+            "fact_scores": scores,
+            "uncertain": state.get("uncertain", []) + ext.uncertain,
+            "decision_cost": state.get("decision_cost", 0.0) + ext.cost,
         }
 
     def safety_screen(state: TriageState) -> dict:
@@ -187,11 +199,17 @@ def handoff_summary(state: TriageState) -> str:
         "",
         "Reported findings:",
     ]
+    scores = state.get("fact_scores", {})
     for key, spec in FIELDS.items():
         if key in facts:
             v = facts[key]
             v = "yes" if v is True else "no" if v is False else v
-            lines.append(f"  - {spec.label}: {v}")
+            score = ""
+            if key in scores:
+                score = f"  (Jev p(yes)={scores[key]:.2f})" if spec.type == "bool" else f"  (Jev p={scores[key]:.2f})"
+            lines.append(f"  - {spec.label}: {v}{score}")
+    if state.get("uncertain"):
+        lines += ["", "Unclear answers (not accepted, re-asked):"] + [f"  - {u}" for u in state["uncertain"]]
     if result.get("triggered_rules"):
         lines += ["", "Rules triggered:"]
         lines += [f"  - [{r['id']}] {r['description']}" for r in result["triggered_rules"]]
