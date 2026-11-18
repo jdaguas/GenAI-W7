@@ -29,7 +29,7 @@ This version builds on the previous TriageFlow assignment. It adds **[Jev](https
 
 Why the clarity check exists: p(yes) alone can't tell "no" apart from "unsure," because neither answer confirms anything. In testing, "Maybe? Hard to tell" scored p(yes) = 0.12, close to a real "no" (0.02–0.06). A second Jev question asks whether the answer is clear and complete, and only then can a warning sign be ruled out.
 
-All yes/no fields are scored in **one Jev request per turn**, about $0.00009 per turn. If Jev fails, the app falls back to GPT's extraction. The app shows each finding's Jev score, the answers it found unclear, and the running Jev cost. The handoff summary includes the scores too.
+All yes/no fields are scored in **one Jev request per turn**, about $0.00009 per turn. If Jev fails, the app falls back to GPT's extraction, but only GPT's "yes" answers are accepted. Its "no" answers are left unknown and asked again, since only Jev plus the clarity check can rule a warning sign out. During an outage a case can still go to the ED, but it can't reach Urgent Care or Primary Care. The app shows each finding's Jev score, the answers it found unclear, and the running Jev cost. The handoff summary includes the scores too.
 
 **GPT vs. Jev on 16 labeled answers** (`python compare.py`):
 

@@ -372,9 +372,7 @@ class JevIntakeAgent:
             resp = self.client.decide(_decision_state(user_message, last_question), questions)
             answers = resp["answers"]
         except Exception as exc:  # network / API problems -> language-agent fallback
-            base.notes = " ".join(filter(None, [
-                base.notes, f"Jev unavailable ({type(exc).__name__}); used {self.language.name} for yes/no fields."]))
-            return base
+            return self._fallback_extraction(base, pending_field, exc)
 
         # Free-form values come from the language agent; yes/no values only from Jev.
         out = {k: v for k, v in base.facts.items() if FIELDS[k].type != "bool" and k != "category"}
@@ -410,6 +408,26 @@ class JevIntakeAgent:
         cost = float((resp.get("usage") or {}).get("cost") or 0.0)
         return Extraction(facts=sanitize_facts(out), notes=base.notes, scores=scores,
                           uncertain=uncertain, cost=cost)
+
+    def _fallback_extraction(self, base: Extraction, pending_field, exc: Exception) -> Extraction:
+        """Use the language agent's facts, but never let it rule a warning sign out.
+
+        Without Jev there is no threshold or clarity check, so a language-agent
+        "yes" is kept (escalating is the safe side) while a "no" is dropped and
+        the field stays unknown. Only Jev plus the clarity check can record "no".
+        """
+        facts = {k: v for k, v in base.facts.items() if not (FIELDS[k].type == "bool" and v is False)}
+        dropped = [k for k in base.facts if k not in facts]
+        uncertain = list(base.uncertain)
+        if pending_field in dropped:
+            uncertain.append(f"{FIELDS[pending_field].label}: \"no\" not accepted "
+                             f"(Jev unavailable, can't confirm the answer is clear)")
+        note = (f"Jev unavailable ({type(exc).__name__}); used {self.language.name} for yes/no fields, "
+                f"accepting only \"yes\" answers.")
+        if dropped:
+            note += f" Not accepted as \"no\": {', '.join(dropped)}."
+        return Extraction(facts=facts, notes=" ".join(filter(None, [base.notes, note])),
+                          scores=base.scores, uncertain=uncertain, cost=base.cost)
 
     def phrase_question(self, field_key, facts, history) -> str:
         return self.language.phrase_question(field_key, facts, history)

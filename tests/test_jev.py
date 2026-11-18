@@ -141,6 +141,32 @@ def test_jev_failure_falls_back_to_language_agent():
     assert any("Jev unavailable" in n for n in state["agent_notes"])
 
 
+def test_jev_failure_does_not_accept_language_agent_no():
+    agent = JevIntakeAgent(FakeJev(fail=True), OfflineIntakeAgent())
+    assert OfflineIntakeAgent().extract("no", "Any fever?", "fever", {"category": "respiratory"}).facts.get("fever") is False
+    ext = agent.extract("no", "Any fever?", "fever", {"category": "respiratory"})
+    assert "fever" not in ext.facts  # stays unknown, so it is re-asked
+    assert any("Fever" in u or "fever" in u for u in ext.uncertain)
+    assert "Not accepted as \"no\": fever" in ext.notes
+
+
+def test_jev_failure_still_accepts_language_agent_yes():
+    agent = JevIntakeAgent(FakeJev(fail=True), OfflineIntakeAgent())
+    assert OfflineIntakeAgent().extract("yes", "Any fever?", "fever", {"category": "respiratory"}).facts.get("fever") is True
+    ext = agent.extract("yes", "Any fever?", "fever", {"category": "respiratory"})
+    assert ext.facts.get("fever") is True
+
+
+def test_jev_outage_cannot_reach_primary_care():
+    s = jev_session(FakeJev(fail=True))
+    state = s.send("I've had a headache for two days, 3/10, I'm 35 years old.")
+    for _ in range(30):
+        if state["status"] == "complete":
+            break
+        state = s.send("no, nothing like that")
+    assert state["result"]["outcome"] == Outcome.NEEDS_REVIEW.value
+
+
 def test_full_intake_with_clear_denials_reaches_primary_care():
     fake = FakeJev()
     s = jev_session(fake)
