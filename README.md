@@ -1,3 +1,5 @@
+HW 7-1 is included in 7-2's folder.
+
 # TriageFlow
 
 An AI-powered medical intake and triage prototype built using Streamlit and Langgraph.
